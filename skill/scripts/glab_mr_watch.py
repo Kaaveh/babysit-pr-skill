@@ -50,6 +50,10 @@ MR_STATE_MAP = {"opened": "OPEN", "merged": "MERGED", "closed": "CLOSED", "locke
 # pipeline either finished or waits for someone to play a manual job.
 PIPELINE_SETTLED_STATUSES = {"manual", "success", "failed", "canceled", "skipped"}
 
+# Job statuses that wait on earlier stages or a `when: delayed` timer. They count as
+# pending but are left out of hung detection.
+WAITING_JOB_STATUSES = {"created", "scheduled"}
+
 # Pipelines that GitLab runs on an MR ref test the merge result, so their sha differs
 # from the MR head by design.
 MERGE_REF_PATTERN = re.compile(r"^refs/merge-requests/\d+/(merge|train)$")
@@ -57,7 +61,12 @@ MERGE_REF_PATTERN = re.compile(r"^refs/merge-requests/\d+/(merge|train)$")
 # GitLab bot users: project and group access tokens, and service accounts.
 BOT_USERNAME_PATTERN = re.compile(r"^(project|group)_\d+_bot|^service_account_")
 
+# GitLab's Developer role: the lowest that can push, like a GitHub collaborator.
+TRUSTED_ACCESS_LEVEL = 30
+
 _AUTHENTICATED_USERNAME_CACHE = {}
+# (host, project id, user id) -> access level on the project, 0 for non-members.
+_MEMBER_ACCESS_CACHE = {}
 
 
 def run_glab(args):
@@ -156,7 +165,7 @@ def normalize_mr(mr, host):
     pr = {
         "number": int(mr["iid"]),
         "url": web_url,
-        "repo": parsed[1] if parsed else str((mr.get("references") or {}).get("full") or ""),
+        "repo": parsed[1] if parsed else str((mr.get("references") or {}).get("full") or "").split("!")[0],
         "host": host,
         "project_id": mr.get("project_id"),
         "pipeline_project_id": pipeline.get("project_id") or mr.get("source_project_id") or mr.get("project_id"),
@@ -231,21 +240,30 @@ def job_bucket(job, pipeline_status):
     return "pending"
 
 
-def head_pipeline_for(mr):
+def head_pipeline_for(pr, mr):
     """The MR's head pipeline, or None when it belongs to an older push."""
     pipeline = mr.get("head_pipeline")
     if not isinstance(pipeline, dict) or not pipeline.get("id"):
         return None
-    if str(pipeline.get("sha") or "") != str(mr.get("sha") or "") and not MERGE_REF_PATTERN.match(
-        str(pipeline.get("ref") or "")
-    ):
+    pipeline_sha = str(pipeline.get("sha") or "")
+    if pipeline_sha == pr["head_sha"]:
+        return pipeline
+    if not MERGE_REF_PATTERN.match(str(pipeline.get("ref") or "")):
+        return None
+    # A merged-results or merge-train pipeline tests a merge commit. Right after a push,
+    # head_pipeline can still be the one for the previous head, so the merge commit must
+    # have the current head as a parent.
+    commit = glab_api(
+        pr["host"], f"projects/{project_ref(pr['pipeline_project_id'])}/repository/commits/{pipeline_sha}"
+    )
+    if not isinstance(commit, dict) or pr["head_sha"] not in (commit.get("parent_ids") or []):
         return None
     return pipeline
 
 
 def get_mr_checks(pr, mr):
     """Return (checks, failed_runs) for the MR head pipeline."""
-    pipeline = head_pipeline_for(mr)
+    pipeline = head_pipeline_for(pr, mr)
     if pipeline is None:
         return [], []
     host = pr["host"]
@@ -308,6 +326,37 @@ def get_authenticated_username(host):
     return _AUTHENTICATED_USERNAME_CACHE[host]
 
 
+def is_trusted_member(host, project_id, user_id):
+    """Developer access or higher on the project, the GitLab match for GitHub's trusted
+    OWNER/MEMBER/COLLABORATOR associations. Only a 404 means "not a member"; any other
+    failure raises, so an outsider's note can never slip through a failed lookup."""
+    if not user_id or not project_id:
+        return False
+    key = (host, str(project_id), str(user_id))
+    if key not in _MEMBER_ACCESS_CACHE:
+        try:
+            member = glab_api(host, f"projects/{project_ref(project_id)}/members/all/{user_id}")
+        except core.GhCommandError as err:
+            if not re.search(r"\bHTTP 404\b", str(err)):
+                raise
+            member = None
+        _MEMBER_ACCESS_CACHE[key] = int((member or {}).get("access_level") or 0)
+    return _MEMBER_ACCESS_CACHE[key] >= TRUSTED_ACCESS_LEVEL
+
+
+def author_role(pr, note, authenticated_username):
+    """"self", "reviewer", or None for notes the watcher ignores (outsiders, other bots)."""
+    author = note.get("author") if isinstance(note.get("author"), dict) else {}
+    username = str(author.get("username") or "")
+    if not username:
+        return None
+    if username == authenticated_username:
+        return "self"
+    if is_gitlab_bot(username):
+        return "reviewer" if is_actionable_bot(username) else None
+    return "reviewer" if is_trusted_member(pr["host"], pr["project_id"], author.get("id")) else None
+
+
 def is_gitlab_bot(username):
     return bool(BOT_USERNAME_PATTERN.match(str(username or "")))
 
@@ -345,7 +394,7 @@ def fetch_review_items(pr, state, authenticated_username):
     `updated_at` and would otherwise bring back a note that was already handled.
     """
     discussions = glab_api_list(
-        pr["host"], f"projects/{project_ref(pr['repo'])}/merge_requests/{pr['number']}/discussions"
+        pr["host"], f"projects/{project_ref(pr['project_id'])}/merge_requests/{pr['number']}/discussions"
     )
     seen_ids = {str(x) for x in state.get("seen_review_comment_ids") or []}
     seen_hashes = {str(k): str(v) for k, v in (state.get("seen_review_comment_updated_at") or {}).items()}
@@ -354,18 +403,20 @@ def fetch_review_items(pr, state, authenticated_username):
     blocking_items = []
     for discussion in discussions:
         notes = [n for n in discussion.get("notes") or [] if isinstance(n, dict) and not n.get("system")]
-        if not notes:
-            continue
         discussion_id = discussion.get("id")
-        if any(n.get("resolvable") and not n.get("resolved") for n in notes):
-            # Open threads always block, whoever wrote them.
-            blocking_items.append(normalize_note(notes[0], discussion_id, pr["url"]))
+        unresolved = any(n.get("resolvable") and not n.get("resolved") for n in notes)
+        blocking_added = False
         for note in notes:
-            item = normalize_note(note, discussion_id, pr["url"])
-            author = item["author"]
-            if not item["id"] or not author or author == authenticated_username:
+            role = author_role(pr, note, authenticated_username)
+            if role is None:
                 continue
-            if is_gitlab_bot(author) and not is_actionable_bot(author):
+            item = normalize_note(note, discussion_id, pr["url"])
+            if unresolved and not blocking_added:
+                # An open thread blocks once the user, a trusted member, or a review bot
+                # wrote in it, as on GitHub.
+                blocking_items.append(item)
+                blocking_added = True
+            if role == "self" or not item["id"]:
                 continue
             digest = body_hash(item["body"])
             if item["id"] in seen_ids and seen_hashes.get(item["id"]) == digest:
@@ -400,13 +451,14 @@ def collect_snapshot(args):
 
     checks, failed_runs = get_mr_checks(pr, mr)
     checks_summary = core.summarize_checks(checks)
-    pending_first_seen = core.update_pending_checks_first_seen(state, checks, now)
-    hung_checks = core.hung_checks_from_checks(checks, pending_first_seen)
+    # Jobs waiting for earlier stages or a delay timer have not started, so they cannot hang.
+    hung_candidates = [check for check in checks if check["state"] not in WAITING_JOB_STATUSES]
+    pending_first_seen = core.update_pending_checks_first_seen(state, hung_candidates, now)
+    hung_checks = core.hung_checks_from_checks(hung_candidates, pending_first_seen)
 
-    try:
-        username = get_authenticated_username(pr["host"])
-    except core.GhCommandError:
-        username = None
+    # Without the username the agent's own replies would come back as new items, so a
+    # failed lookup fails the snapshot and the loops retry.
+    username = get_authenticated_username(pr["host"])
     new_review_items, blocking_review_items = fetch_review_items(pr, state, username)
 
     checks_terminal_elapsed = core.update_checks_terminal_elapsed(

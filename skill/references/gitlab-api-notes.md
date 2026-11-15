@@ -45,9 +45,11 @@ with an error naming GitLab 15.6.
 
 ### Pipeline jobs
 
-The watcher reads `head_pipeline` from the MR. When it is missing, or its `sha` differs from the MR `sha` and its ref
-is not `refs/merge-requests/<iid>/merge` or `/train`, the check list is empty (the pipeline for the new push has not
-appeared yet). Otherwise:
+The watcher reads `head_pipeline` from the MR. When it is missing, or its `sha` differs from the MR `sha`, the check
+list is empty (the pipeline for the new push has not appeared yet). The exception is a merged-results or merge-train
+pipeline (ref `refs/merge-requests/<iid>/merge` or `/train`), which tests a merge commit: it counts only when that
+commit has the MR head as a parent, read with
+`glab api --hostname <host> projects/<pipeline project id>/repository/commits/<sha>`. Otherwise:
 
 ```bash
 glab api --hostname <host> 'projects/<pipeline project id>/pipelines/<id>/jobs?per_page=100&page=<n>'
@@ -66,7 +68,8 @@ Each job becomes a check (`name`, `state` = job status, `workflow` = stage, `lin
 | `created` while the pipeline is `manual` or finished | ignored (waits behind a manual gate) |
 | any other status | `pending` |
 
-`required_checks`, `expected_skipped_checks`, and `hung_check_minutes` use the GitLab **job name**. A blocking manual
+`required_checks`, `expected_skipped_checks`, and `hung_check_minutes` use the GitLab **job name**. Jobs in
+`created` (waiting for earlier stages) or `scheduled` (a delay timer) count as pending but never as hung. A blocking manual
 job gives `diagnose_skipping_checks`; when it is expected on every MR, add its name to `expected_skipped_checks`.
 
 ### Failed jobs and retries
@@ -84,17 +87,24 @@ Diagnose a failure with `glab ci view` or `glab ci trace <job id> -R <group>/<pr
 ### Discussions
 
 ```bash
-glab api --hostname <host> 'projects/<url-encoded path>/merge_requests/<iid>/discussions?per_page=100&page=<n>'
+glab api --hostname <host> 'projects/<project id>/merge_requests/<iid>/discussions?per_page=100&page=<n>'
 glab api --hostname <host> user
+glab api --hostname <host> projects/<project id>/members/all/<user id>
 ```
 
-System notes are skipped. A note is a **new item** when someone other than the authenticated user wrote it and its ID
-or body is new (the body is compared, not `updated_at`, because resolving a thread changes `updated_at`). The first
-note of every discussion with an unresolved resolvable note is a **blocking item**, whoever wrote it. Review items
-carry `discussion_id`; `kind` is `review_comment` for diff notes and `issue_comment` otherwise.
+System notes are skipped. A note counts when its author is a **trusted member** (Developer access or higher on the
+project, the match for GitHub's `OWNER`/`MEMBER`/`COLLABORATOR`; `trusted_author_associations` does not apply), a
+review bot, or the authenticated user. Notes from anyone else are ignored, and so are their threads. A failed member
+or `user` lookup (other than a 404) fails the snapshot, and the loops retry.
 
-Bot users are usernames matching `project_<n>_bot…`, `group_<n>_bot…`, or `service_account_…`. Their notes count only
-when the username contains a `review_bot_login_keywords` entry. `trusted_author_associations` does not apply on GitLab.
+A counted note is a **new item** when someone other than the authenticated user wrote it and its ID or body is new
+(the body is compared, not `updated_at`, because resolving a thread changes `updated_at`). An unresolved resolvable
+discussion is a **blocking item** (its first counted note) once a counted note is in it. Review items carry
+`discussion_id`; `kind` is `review_comment` for diff notes and `issue_comment` otherwise. A plain comment (not started
+as a thread) is not resolvable and never blocks.
+
+Bot users are usernames matching `project_<n>_bot…`, `group_<n>_bot…`, or `service_account_…`. They count as review
+bots only when the username contains a `review_bot_login_keywords` entry.
 The Codex and PR-AF gates are GitHub-only: the watcher forces `codex.enabled`, `codex.required`, and `pr_af.enabled`
 off, and `codex_gate` and `pr_af_gate` are always `null`.
 

@@ -10,8 +10,10 @@ All notable changes to this skill are listed here. Versions follow semantic vers
   `skill/scripts/glab_mr_watch.py`. It takes the same flags and returns the same JSON and actions as `gh_pr_watch.py`,
   reusing its CLI, loops, state, and readiness rules. It maps `detailed_merge_status` onto the merge states (unknown
   values fail closed), pipeline jobs onto checks (skipped jobs, allowed failures, and optional manual jobs never
-  block; a blocking manual job gives `diagnose_skipping_checks`), and MR discussions onto review items and blocking
-  threads. `--retry-failed-now` retries jobs through the jobs API. The Codex and PR-AF gates stay GitHub-only.
+  block; a blocking manual job gives `diagnose_skipping_checks`; waiting jobs never count as hung), and MR discussions
+  onto review items and blocking threads. Only project members with Developer access or higher, review bots, and the
+  authenticated user count as reviewers. A merged-results pipeline counts only when its merge commit contains the
+  current head. `--retry-failed-now` retries jobs through the jobs API. The Codex and PR-AF gates stay GitHub-only.
 - `skill/references/gitlab-api-notes.md`, a GitLab section in `SKILL.md`, and two GitLab eval scenarios.
 
 ### Changed

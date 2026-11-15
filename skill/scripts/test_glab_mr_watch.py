@@ -70,7 +70,7 @@ def note(note_id, author, body="please fix", resolvable=False, resolved=False, d
         "id": note_id,
         "type": "DiffNote" if diff else None,
         "body": body,
-        "author": {"username": author},
+        "author": {"username": author, "id": user_id(author)},
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": updated_at,
         "system": system,
@@ -80,6 +80,10 @@ def note(note_id, author, body="please fix", resolvable=False, resolved=False, d
     }
 
 
+def user_id(username):
+    return sum(ord(ch) for ch in username)
+
+
 def discussion(disc_id, *notes):
     return {"id": disc_id, "notes": list(notes)}
 
@@ -87,15 +91,22 @@ def discussion(disc_id, *notes):
 class FakeGlab:
     """Stands in for `glab`: answers by endpoint, records every call."""
 
-    def __init__(self, mr, jobs=(), bridges=(), discussions=(), username="me"):
+    def __init__(self, mr, jobs=(), bridges=(), discussions=(), username="me", members=None, commits=None,
+                 failing=()):
         self.calls = []
+        self.failing = set(failing)
         self.routes = {
             f"projects/{ENC}/merge_requests/7": mr,
             "projects/11/pipelines/99/jobs": list(jobs),
             "projects/11/pipelines/99/bridges": list(bridges),
-            f"projects/{ENC}/merge_requests/7/discussions": list(discussions),
+            "projects/11/merge_requests/7/discussions": list(discussions),
             "user": {"username": username},
         }
+        # Trusted Developer by default; pass members to change access levels.
+        for name, level in (members if members is not None else {"alice": 30}).items():
+            self.routes[f"projects/11/members/all/{user_id(name)}"] = {"access_level": level}
+        for sha, parents in (commits or {}).items():
+            self.routes[f"projects/11/repository/commits/{sha}"] = {"id": sha, "parent_ids": parents}
 
     def __call__(self, args):
         self.calls.append(list(args))
@@ -106,8 +117,12 @@ class FakeGlab:
         if "-X" in args:
             return "{}"
         path, _, query = endpoint.partition("?")
+        if path in self.failing:
+            raise core.GhCommandError(f"GitLab CLI command failed: glab api {path}\nstderr: glab: 500 (HTTP 500)")
         if "page=" in query and "page=1" not in query.split("&"):
             return "[]"
+        if path not in self.routes:
+            raise core.GhCommandError(f"GitLab CLI command failed: glab api {path}\nstderr: glab: 404 Not Found (HTTP 404)")
         return json.dumps(self.routes[path])
 
 
@@ -117,6 +132,7 @@ class GlabTestCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.state_file = os.path.join(self.tmp.name, "state.json")
         glab._AUTHENTICATED_USERNAME_CACHE.clear()
+        glab._MEMBER_ACCESS_CACHE.clear()
         cfg = configured()
         cfg.start()
         self.addCleanup(cfg.stop)
@@ -126,7 +142,7 @@ class GlabTestCase(unittest.TestCase):
         values.update(overrides)
         return SimpleNamespace(**values)
 
-    def seed_state(self, terminal_seconds_ago=None, seen=()):
+    def seed_state(self, terminal_seconds_ago=None, seen=(), pending_since=None):
         now = int(time.time())
         state, _ = core.load_state(core.Path(self.state_file))
         state["last_snapshot_at"] = now
@@ -134,6 +150,8 @@ class GlabTestCase(unittest.TestCase):
         if terminal_seconds_ago is not None:
             state["checks_terminal_sha"] = SHA
             state["checks_went_terminal_at"] = now - terminal_seconds_ago
+        for key, seconds_ago in (pending_since or {}).items():
+            state["pending_checks_first_seen_at"][key] = now - seconds_ago
         for note_id, body in seen:
             state["seen_review_comment_ids"].append(str(note_id))
             state["seen_review_comment_updated_at"][str(note_id)] = glab.body_hash(body)
@@ -307,6 +325,27 @@ class SnapshotTests(GlabTestCase):
         snapshot = self.snapshot(FakeGlab(mr_payload(pipeline_status="running"), jobs=jobs))
         self.assertEqual(snapshot["actions"], ["idle"])
 
+    def test_jobs_waiting_for_earlier_stages_never_hang(self):
+        link = f"https://{HOST}/{PATH}/-/jobs/"
+        self.seed_state(pending_since={f"deploy|deploy|{link}deploy": 3600, f"later|deploy|{link}later": 3600})
+        jobs = [job("build", "running"), job("deploy", "created", stage="deploy"),
+                job("later", "scheduled", stage="deploy")]
+        snapshot = self.snapshot(FakeGlab(mr_payload(pipeline_status="running"), jobs=jobs))
+        self.assertEqual(snapshot["hung_checks"], [])
+        self.assertEqual(snapshot["actions"], ["idle"])
+
+    def test_job_stuck_pending_still_hangs(self):
+        link = f"https://{HOST}/{PATH}/-/jobs/"
+        self.seed_state(pending_since={f"build|build|{link}build": 3600})
+        snapshot = self.snapshot(FakeGlab(mr_payload(pipeline_status="pending"), jobs=[job("build", "pending")]))
+        self.assertEqual([check["name"] for check in snapshot["hung_checks"]], ["build"])
+        self.assertIn("diagnose_hung_check", snapshot["actions"])
+
+    def test_failed_user_lookup_fails_the_snapshot(self):
+        fake = FakeGlab(mr_payload(), jobs=[job("test", "success")], failing={"user"})
+        with self.assertRaises(core.GhCommandError):
+            self.snapshot(fake)
+
     def test_failed_job_is_non_retryable(self):
         jobs = [job("unit", "failed", job_id=5), job("lint", "success")]
         snapshot = self.snapshot(FakeGlab(mr_payload(pipeline_status="failed"), jobs=jobs))
@@ -342,12 +381,23 @@ class SnapshotTests(GlabTestCase):
         self.assertNotIn("stop_ready_to_merge", snapshot["actions"])
         self.assertFalse(any("pipelines/99" in call[-1] for call in fake.calls))
 
-    def test_merge_ref_pipeline_counts(self):
-        self.seed_state(terminal_seconds_ago=120)
+    def merge_ref_payload(self):
         payload = mr_payload(pipeline_sha="c" * 40)
         payload["head_pipeline"]["ref"] = "refs/merge-requests/7/merge"
-        snapshot = self.snapshot(FakeGlab(payload, jobs=[job("test", "success")]))
-        self.assertEqual(snapshot["actions"], ["stop_ready_to_merge"])
+        return payload
+
+    def test_merge_ref_pipeline_of_the_current_head_counts(self):
+        self.seed_state(terminal_seconds_ago=120)
+        fake = FakeGlab(self.merge_ref_payload(), jobs=[job("test", "success")], commits={"c" * 40: ["f" * 40, SHA]})
+        self.assertEqual(self.snapshot(fake)["actions"], ["stop_ready_to_merge"])
+
+    def test_merge_ref_pipeline_of_a_previous_head_gives_no_checks(self):
+        self.seed_state(terminal_seconds_ago=120)
+        fake = FakeGlab(self.merge_ref_payload(), jobs=[job("test", "success")],
+                        commits={"c" * 40: ["f" * 40, "b" * 40]})
+        snapshot = self.snapshot(fake)
+        self.assertEqual(snapshot["checks"]["check_count"], 0)
+        self.assertNotIn("stop_ready_to_merge", snapshot["actions"])
 
     def test_no_pipeline_gives_no_checks(self):
         self.seed_state(terminal_seconds_ago=120)
@@ -407,6 +457,33 @@ class ReviewItemTests(GlabTestCase):
         self.seed_state(terminal_seconds_ago=120)
         snapshot = self.snapshot(self.ready_fake(discussion("d1", note(1, "alice", system=True, resolvable=True))))
         self.assertEqual(snapshot["actions"], ["stop_ready_to_merge"])
+
+    def test_outsider_notes_and_threads_are_ignored(self):
+        self.seed_state(terminal_seconds_ago=120)
+        fake = self.ready_fake(discussion("d1", note(1, "mallory", resolvable=True, diff=True)))
+        snapshot = self.snapshot(fake)
+        self.assertEqual((snapshot["new_review_items"], snapshot["blocking_review_items"]), ([], []))
+        self.assertEqual(snapshot["actions"], ["stop_ready_to_merge"])
+
+    def test_reporter_access_is_not_trusted(self):
+        self.seed_state(terminal_seconds_ago=120)
+        fake = FakeGlab(mr_payload(), jobs=[job("test", "success")], members={"alice": 20},
+                        discussions=[discussion("d1", note(1, "alice"))])
+        self.assertEqual(self.snapshot(fake)["new_review_items"], [])
+
+    def test_member_reply_makes_an_outsider_thread_block(self):
+        self.seed_state(terminal_seconds_ago=120)
+        thread = discussion("d1", note(1, "mallory", resolvable=True), note(2, "alice", body="agreed", resolvable=True))
+        snapshot = self.snapshot(self.ready_fake(thread))
+        self.assertEqual([item["id"] for item in snapshot["new_review_items"]], ["2"])
+        self.assertEqual([item["id"] for item in snapshot["blocking_review_items"]], ["2"])
+
+    def test_failed_member_lookup_fails_the_snapshot(self):
+        fake = FakeGlab(mr_payload(), jobs=[job("test", "success")],
+                        discussions=[discussion("d1", note(1, "alice"))],
+                        failing={f"projects/11/members/all/{user_id('alice')}"})
+        with self.assertRaises(core.GhCommandError):
+            self.snapshot(fake)
 
     def test_bot_notes_need_a_keyword(self):
         self.seed_state(terminal_seconds_ago=120)

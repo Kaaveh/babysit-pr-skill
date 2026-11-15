@@ -81,8 +81,9 @@ when the harness reads live streamed stdout. Read `actions` from:
   `glab ci trace <job-id>`, never declare an MR green from them. `pr.detailed_merge_status` holds GitLab's raw verdict.
 - Check names are **job names**. A blocking manual job (`allow_failure: false`) gives `diagnose_skipping_checks`: tell
   the owner it needs someone to click Run, and never play manual jobs (they often deploy) without the owner's go-ahead.
-- Codex and PR-AF gates are off. Unresolved threads block as on GitHub; reply and resolve through the discussions API,
-  and update a `need_rebase` branch by merging the target into it (never GitLab's Rebase button or `/rebase`).
+- Codex and PR-AF gates are off. Only notes from members with Developer access or higher, review bots, and you count.
+  Unresolved threads block as on GitHub; reply and resolve through the discussions API, and update a `need_rebase`
+  branch by merging the target into it (never GitLab's Rebase button or `/rebase`).
 
 ## Review gates and threads
 
