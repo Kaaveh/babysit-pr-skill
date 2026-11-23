@@ -6,6 +6,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import parse_qs
 
 SCRIPT_DIR = os.path.dirname(__file__)
 if SCRIPT_DIR not in sys.path:
@@ -92,7 +93,7 @@ class FakeGlab:
     """Stands in for `glab`: answers by endpoint, records every call."""
 
     def __init__(self, mr, jobs=(), bridges=(), discussions=(), username="me", members=None, commits=None,
-                 failing=()):
+                 failing=(), bots=(), non_bots=()):
         self.calls = []
         self.failing = set(failing)
         self.routes = {
@@ -105,6 +106,10 @@ class FakeGlab:
         # Trusted Developer by default; pass members to change access levels.
         for name, level in (members if members is not None else {"alice": 30}).items():
             self.routes[f"projects/11/members/all/{user_id(name)}"] = {"access_level": level}
+        for name in bots:
+            self.routes[f"users/{user_id(name)}"] = {"id": user_id(name), "username": name, "bot": True}
+        for name in non_bots:
+            self.routes[f"users/{user_id(name)}"] = {"id": user_id(name), "username": name, "bot": False}
         for sha, parents in (commits or {}).items():
             self.routes[f"projects/11/repository/commits/{sha}"] = {"id": sha, "parent_ids": parents}
 
@@ -119,11 +124,17 @@ class FakeGlab:
         path, _, query = endpoint.partition("?")
         if path in self.failing:
             raise core.GhCommandError(f"GitLab CLI command failed: glab api {path}\nstderr: glab: 500 (HTTP 500)")
-        if "page=" in query and "page=1" not in query.split("&"):
-            return "[]"
         if path not in self.routes:
             raise core.GhCommandError(f"GitLab CLI command failed: glab api {path}\nstderr: glab: 404 Not Found (HTTP 404)")
-        return json.dumps(self.routes[path])
+        payload = self.routes[path]
+        if isinstance(payload, list) and query:
+            params = parse_qs(query)
+            if "page" in params:
+                page = int(params["page"][0])
+                per_page = int(params.get("per_page", [glab.PAGE_SIZE])[0])
+                start = (page - 1) * per_page
+                payload = payload[start : start + per_page]
+        return json.dumps(payload)
 
 
 class GlabTestCase(unittest.TestCase):
@@ -133,6 +144,7 @@ class GlabTestCase(unittest.TestCase):
         self.state_file = os.path.join(self.tmp.name, "state.json")
         glab._AUTHENTICATED_USERNAME_CACHE.clear()
         glab._MEMBER_ACCESS_CACHE.clear()
+        glab._USER_IS_BOT_CACHE.clear()
         cfg = configured()
         cfg.start()
         self.addCleanup(cfg.stop)
@@ -202,11 +214,18 @@ class DetailedMergeStatusTests(unittest.TestCase):
         self.assertEqual(opened["repo"], PATH)
         self.assertEqual(opened["labels"], ["backend"])
 
-    def test_need_rebase_respects_require_up_to_date_false(self):
+    def test_need_rebase_always_requires_up_to_date(self):
         with configured():
             self.assertTrue(glab.normalize_mr(mr_payload("need_rebase"), HOST)["up_to_date_required"])
         with configured({"require_up_to_date": False}):
-            self.assertFalse(glab.normalize_mr(mr_payload("need_rebase"), HOST)["up_to_date_required"])
+            self.assertTrue(glab.normalize_mr(mr_payload("need_rebase"), HOST)["up_to_date_required"])
+
+    def test_draft_and_wip_flags_override_detailed_merge_status(self):
+        for flag in ("draft", "work_in_progress"):
+            payload = mr_payload("not_approved")
+            payload[flag] = True
+            with configured():
+                self.assertEqual(glab.normalize_mr(payload, HOST)["merge_state_status"], "DRAFT")
 
 
 class JobBucketTests(unittest.TestCase):
@@ -232,11 +251,17 @@ class JobBucketTests(unittest.TestCase):
 
 
 class MrUrlTests(unittest.TestCase):
-    def test_self_hosted_nested_group_with_port(self):
+    def test_self_hosted_nested_group(self):
         self.assertEqual(
-            glab.parse_mr_url("https://git.corp.example:8443/a/b/c/-/merge_requests/42/diffs"),
-            ("git.corp.example:8443", "a/b/c", 42),
+            glab.parse_mr_url("https://git.corp.example/a/b/c/-/merge_requests/42/diffs"),
+            ("git.corp.example", "a/b/c", 42),
         )
+
+    def test_rejects_port_and_userinfo(self):
+        with self.assertRaisesRegex(ValueError, "port"):
+            glab.parse_mr_url("https://git.corp.example:8443/a/b/c/-/merge_requests/42/diffs")
+        with self.assertRaisesRegex(ValueError, "userinfo"):
+            glab.parse_mr_url("https://gitlab.com@evil.example/a/b/-/merge_requests/42")
 
     def test_rejects_github_and_garbage(self):
         self.assertIsNone(glab.parse_mr_url("https://github.com/o/r/pull/1"))
@@ -409,6 +434,30 @@ class SnapshotTests(GlabTestCase):
         self.assertEqual(snapshot["actions"], ["stop_pr_closed"])
         self.assertFalse(snapshot["pr"]["merged"])
 
+    def test_failed_pipeline_with_all_green_jobs_blocks_readiness(self):
+        self.seed_state(terminal_seconds_ago=120)
+        for status in ("failed", "canceled"):
+            snapshot = self.snapshot(FakeGlab(mr_payload(pipeline_status=status), jobs=[job("test", "success")]))
+            self.assertEqual(snapshot["actions"], ["diagnose_ci_failure", "stop_non_retryable_failure"])
+            self.assertEqual(snapshot["checks"]["failed_count"], 1)
+
+    def test_running_pipeline_with_all_green_jobs_stays_pending(self):
+        self.seed_state(terminal_seconds_ago=120)
+        snapshot = self.snapshot(FakeGlab(mr_payload(pipeline_status="running"), jobs=[job("test", "success")]))
+        self.assertEqual(snapshot["actions"], ["idle"])
+        self.assertEqual(snapshot["checks"]["pending_count"], 1)
+
+    def test_glab_api_list_paginates_across_multiple_pages(self):
+        self.seed_state(terminal_seconds_ago=120)
+        jobs = [job(f"job{i}", "success", job_id=i) for i in range(1, 5)]
+        fake = FakeGlab(mr_payload(), jobs=jobs)
+        with patch.object(glab, "PAGE_SIZE", 2):
+            snapshot = self.snapshot(fake)
+        self.assertEqual(snapshot["checks"]["passed_count"], 4)
+        self.assertEqual(snapshot["actions"], ["stop_ready_to_merge"])
+        job_calls = [c[-1] for c in fake.calls if "/jobs?" in c[-1]]
+        self.assertEqual(len(job_calls), 3)
+
 
 class ReviewItemTests(GlabTestCase):
     def ready_fake(self, *discussions, username="me"):
@@ -487,12 +536,29 @@ class ReviewItemTests(GlabTestCase):
 
     def test_bot_notes_need_a_keyword(self):
         self.seed_state(terminal_seconds_ago=120)
-        fake = self.ready_fake(
-            discussion("d1", note(1, "project_11_bot_abc", body="deployed")),
-            discussion("d2", note(2, "service_account_codex_reviewer", body="finding")),
+        fake = FakeGlab(
+            mr_payload(),
+            jobs=[job("test", "success")],
+            discussions=[
+                discussion("d1", note(1, "project_11_bot_abc", body="deployed")),
+                discussion("d2", note(2, "service_account_codex_reviewer", body="finding")),
+            ],
+            bots={"project_11_bot_abc", "service_account_codex_reviewer"},
         )
         snapshot = self.snapshot(fake)
         self.assertEqual([item["id"] for item in snapshot["new_review_items"]], ["2"])
+
+    def test_lookalike_bot_username_from_non_member_is_ignored(self):
+        self.seed_state(terminal_seconds_ago=120)
+        fake = FakeGlab(
+            mr_payload(),
+            jobs=[job("test", "success")],
+            discussions=[discussion("d1", note(1, "project_1_bot_codex", body="finding", resolvable=True))],
+            non_bots={"project_1_bot_codex"},
+        )
+        snapshot = self.snapshot(fake)
+        self.assertEqual((snapshot["new_review_items"], snapshot["blocking_review_items"]), ([], []))
+        self.assertEqual(snapshot["actions"], ["stop_ready_to_merge"])
 
 
 class ConfigTests(unittest.TestCase):
@@ -508,6 +574,18 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config["codex"]["required"])
         self.assertFalse(config["pr_af"]["enabled"])
         self.assertTrue(any("do not apply to GitLab" in str(c) for c in stderr.write.call_args_list))
+
+    def test_main_swaps_core_hooks(self):
+        with patch.object(core, "collect_snapshot", core.collect_snapshot), \
+                patch.object(core, "rerun_failed_run", core.rerun_failed_run), \
+                patch.object(core, "activate_config", core.activate_config), \
+                patch.object(core, "main", return_value=42) as mock_main:
+            exit_code = glab.main()
+            self.assertEqual(exit_code, 42)
+            self.assertIs(core.collect_snapshot, glab.collect_snapshot)
+            self.assertIs(core.rerun_failed_run, glab.retry_job)
+            self.assertIs(core.activate_config, glab.activate_config)
+            mock_main.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -67,6 +67,8 @@ TRUSTED_ACCESS_LEVEL = 30
 _AUTHENTICATED_USERNAME_CACHE = {}
 # (host, project id, user id) -> access level on the project, 0 for non-members.
 _MEMBER_ACCESS_CACHE = {}
+# (host, user id) -> whether GitLab marks the account as a bot.
+_USER_IS_BOT_CACHE = {}
 
 
 def run_glab(args):
@@ -140,10 +142,14 @@ def parse_mr_url(url):
     parsed = urlparse(str(url or ""))
     if not parsed.scheme or not parsed.netloc:
         return None
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("GitLab MR URL must not contain userinfo")
+    if parsed.port is not None:
+        raise ValueError(f"GitLab MR URLs with a port are not supported by glab --hostname: {parsed.netloc}")
     match = re.fullmatch(r"/(?P<path>.+?)/-/merge_requests/(?P<iid>\d+)(/.*)?", parsed.path)
-    if not match:
+    if not match or not parsed.hostname:
         return None
-    return parsed.netloc, match.group("path"), int(match.group("iid"))
+    return parsed.hostname, match.group("path"), int(match.group("iid"))
 
 
 def map_detailed_merge_status(value):
@@ -158,6 +164,8 @@ def normalize_mr(mr, host):
             f"GitLab {host} has no detailed_merge_status; GitLab 15.6 or newer is required"
         )
     mergeable, merge_state_status, review_decision = map_detailed_merge_status(detailed)
+    if mr.get("draft") or mr.get("work_in_progress"):
+        merge_state_status = "DRAFT"
     raw_state = str(mr.get("state") or "")
     web_url = str(mr.get("web_url") or "")
     parsed = parse_mr_url(web_url)
@@ -182,9 +190,8 @@ def normalize_mr(mr, host):
         "labels": [str(label) for label in mr.get("labels") or [] if label],
     }
     if merge_state_status in core.MERGE_BEHIND_STATES:
-        # `need_rebase` already means the merge method wants an up-to-date branch, so
-        # "auto" counts as required. Only an explicit false turns it off.
-        pr["up_to_date_required"] = core.CONFIG["require_up_to_date"] is not False
+        # `need_rebase` means GitLab refuses to merge until rebased (fast-forward/semi-linear).
+        pr["up_to_date_required"] = True
     return pr
 
 
@@ -305,6 +312,45 @@ def get_mr_checks(pr, mr):
                     and (core.is_retry_eligible_workflow_name(name) or core.is_retry_eligible_workflow_name(stage)),
                 }
             )
+    if pipeline_status in ("failed", "canceled") and not failed_runs:
+        checks.append(
+            {
+                "name": "pipeline",
+                "state": pipeline_status,
+                "bucket": "cancel" if pipeline_status == "canceled" else "fail",
+                "link": str(pipeline.get("web_url") or ""),
+                "workflow": "pipeline",
+                "startedAt": pipeline.get("started_at") or "",
+                "completedAt": pipeline.get("finished_at") or "",
+            }
+        )
+        failed_runs.append(
+            {
+                "run_id": pipeline.get("id"),
+                "workflow_name": "pipeline",
+                "stage": "pipeline",
+                "status": pipeline_status,
+                "conclusion": pipeline_status,
+                "html_url": str(pipeline.get("web_url") or ""),
+                "retry_eligible": False,
+            }
+        )
+    elif (
+        pipeline_status
+        and pipeline_status not in PIPELINE_SETTLED_STATUSES
+        and not any(c["bucket"] == "pending" for c in checks)
+    ):
+        checks.append(
+            {
+                "name": "pipeline",
+                "state": pipeline_status,
+                "bucket": "pending",
+                "link": str(pipeline.get("web_url") or ""),
+                "workflow": "pipeline",
+                "startedAt": pipeline.get("started_at") or "",
+                "completedAt": pipeline.get("finished_at") or "",
+            }
+        )
     failed_runs.sort(key=lambda run: (run["workflow_name"], str(run["run_id"])))
     return checks, failed_runs
 
@@ -326,6 +372,16 @@ def get_authenticated_username(host):
     return _AUTHENTICATED_USERNAME_CACHE[host]
 
 
+def _glab_api_or_none_on_404(host, endpoint):
+    """Fetch an API object, treating HTTP 404 as None and re-raising any other failure."""
+    try:
+        return glab_api(host, endpoint)
+    except core.GhCommandError as err:
+        if not re.search(r"\bHTTP 404\b", str(err)):
+            raise
+        return None
+
+
 def is_trusted_member(host, project_id, user_id):
     """Developer access or higher on the project, the GitLab match for GitHub's trusted
     OWNER/MEMBER/COLLABORATOR associations. Only a 404 means "not a member"; any other
@@ -334,14 +390,26 @@ def is_trusted_member(host, project_id, user_id):
         return False
     key = (host, str(project_id), str(user_id))
     if key not in _MEMBER_ACCESS_CACHE:
-        try:
-            member = glab_api(host, f"projects/{project_ref(project_id)}/members/all/{user_id}")
-        except core.GhCommandError as err:
-            if not re.search(r"\bHTTP 404\b", str(err)):
-                raise
-            member = None
+        member = _glab_api_or_none_on_404(host, f"projects/{project_ref(project_id)}/members/all/{user_id}")
         _MEMBER_ACCESS_CACHE[key] = int((member or {}).get("access_level") or 0)
     return _MEMBER_ACCESS_CACHE[key] >= TRUSTED_ACCESS_LEVEL
+
+
+def is_verified_gitlab_bot(host, author):
+    """True when the username matches a GitLab bot pattern AND GitLab marks the account `bot: true`."""
+    username = str(author.get("username") or "")
+    if not is_gitlab_bot(username):
+        return False
+    if isinstance(author.get("bot"), bool):
+        return author["bot"]
+    user_id = author.get("id")
+    if not user_id:
+        return False
+    key = (host, str(user_id))
+    if key not in _USER_IS_BOT_CACHE:
+        user = _glab_api_or_none_on_404(host, f"users/{user_id}")
+        _USER_IS_BOT_CACHE[key] = bool((user or {}).get("bot"))
+    return _USER_IS_BOT_CACHE[key]
 
 
 def author_role(pr, note, authenticated_username):
@@ -352,7 +420,7 @@ def author_role(pr, note, authenticated_username):
         return None
     if username == authenticated_username:
         return "self"
-    if is_gitlab_bot(username):
+    if is_verified_gitlab_bot(pr["host"], author):
         return "reviewer" if is_actionable_bot(username) else None
     return "reviewer" if is_trusted_member(pr["host"], pr["project_id"], author.get("id")) else None
 
