@@ -560,6 +560,21 @@ class ReviewItemTests(GlabTestCase):
         self.assertEqual((snapshot["new_review_items"], snapshot["blocking_review_items"]), ([], []))
         self.assertEqual(snapshot["actions"], ["stop_ready_to_merge"])
 
+    def test_deleted_line_diff_note_preserves_old_line_and_side(self):
+        self.seed_state(terminal_seconds_ago=120)
+        deleted_note = note(1, "alice", resolvable=True, diff=True)
+        deleted_note["position"] = {
+            "old_path": "src/old.py",
+            "new_path": None,
+            "old_line": 12,
+            "new_line": None,
+            "head_sha": SHA,
+        }
+        snapshot = self.snapshot(self.ready_fake(discussion("d1", deleted_note)))
+        for key in ("new_review_items", "blocking_review_items"):
+            item = snapshot[key][0]
+            self.assertEqual((item["path"], item["line"], item["side"]), ("src/old.py", 12, "old"))
+
 
 class ConfigTests(unittest.TestCase):
     def test_codex_and_pr_af_are_forced_off(self):

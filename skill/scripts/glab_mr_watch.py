@@ -440,6 +440,17 @@ def body_hash(body):
 
 def normalize_note(note, discussion_id, mr_url):
     position = note.get("position") if isinstance(note.get("position"), dict) else {}
+    new_line = position.get("new_line")
+    old_line = position.get("old_line")
+    if new_line is not None:
+        line, side = new_line, "new"
+        path = position.get("new_path") or position.get("old_path")
+    elif old_line is not None:
+        line, side = old_line, "old"
+        path = position.get("old_path") or position.get("new_path")
+    else:
+        line, side = None, None
+        path = position.get("new_path") or position.get("old_path")
     return {
         "kind": "review_comment" if note.get("type") == "DiffNote" else "issue_comment",
         "id": str(note.get("id") or ""),
@@ -448,8 +459,9 @@ def normalize_note(note, discussion_id, mr_url):
         "created_at": str(note.get("created_at") or ""),
         "updated_at": str(note.get("updated_at") or ""),
         "body": str(note.get("body") or ""),
-        "path": position.get("new_path"),
-        "line": position.get("new_line"),
+        "path": path,
+        "line": line,
+        "side": side,
         "commit_id": position.get("head_sha"),
         "url": f"{mr_url}#note_{note.get('id')}",
     }
