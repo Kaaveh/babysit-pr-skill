@@ -44,7 +44,7 @@ DETAILED_MERGE_STATUS_MAP = {
 }
 UNKNOWN_MERGE_STATUS = ("MERGEABLE", "BLOCKED", "")
 
-MR_STATE_MAP = {"opened": "OPEN", "merged": "MERGED", "closed": "CLOSED", "locked": "CLOSED"}
+MR_STATE_MAP = {"opened": "OPEN", "merged": "MERGED", "closed": "CLOSED", "locked": "LOCKED"}
 
 # Pipeline statuses after which a `created` job will never start on its own: the
 # pipeline either finished or waits for someone to play a manual job.
@@ -164,9 +164,11 @@ def normalize_mr(mr, host):
             f"GitLab {host} has no detailed_merge_status; GitLab 15.6 or newer is required"
         )
     mergeable, merge_state_status, review_decision = map_detailed_merge_status(detailed)
-    if mr.get("draft") or mr.get("work_in_progress"):
-        merge_state_status = "DRAFT"
     raw_state = str(mr.get("state") or "")
+    if raw_state == "locked":
+        mergeable, merge_state_status = "UNKNOWN", "UNKNOWN"
+    elif mr.get("draft") or mr.get("work_in_progress"):
+        merge_state_status = "DRAFT"
     web_url = str(mr.get("web_url") or "")
     parsed = parse_mr_url(web_url)
     pipeline = mr.get("head_pipeline") if isinstance(mr.get("head_pipeline"), dict) else {}
@@ -182,7 +184,7 @@ def normalize_mr(mr, host):
         "base_branch": str(mr.get("target_branch") or ""),
         "state": MR_STATE_MAP.get(raw_state, raw_state.upper()),
         "merged": raw_state == "merged",
-        "closed": raw_state != "opened",
+        "closed": raw_state not in ("opened", "locked"),
         "mergeable": mergeable,
         "merge_state_status": merge_state_status,
         "review_decision": review_decision,

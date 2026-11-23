@@ -434,6 +434,15 @@ class SnapshotTests(GlabTestCase):
         self.assertEqual(snapshot["actions"], ["stop_pr_closed"])
         self.assertFalse(snapshot["pr"]["merged"])
 
+    def test_locked_mr_keeps_polling(self):
+        self.seed_state(terminal_seconds_ago=120)
+        for detailed in ("not_open", "mergeable"):
+            snapshot = self.snapshot(FakeGlab(mr_payload(detailed, state="locked"), jobs=[job("test", "success")]))
+            self.assertEqual(snapshot["pr"]["state"], "LOCKED")
+            self.assertFalse(snapshot["pr"]["closed"])
+            self.assertFalse(snapshot["pr"]["merged"])
+            self.assertEqual(snapshot["actions"], ["idle"])
+
     def test_failed_pipeline_with_all_green_jobs_blocks_readiness(self):
         self.seed_state(terminal_seconds_ago=120)
         for status in ("failed", "canceled"):
